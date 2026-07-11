@@ -11,10 +11,35 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 logger = logging.getLogger("moviebox-api")
 
-# ──── Proxy Configuration ────
+# ──── Proxy & Spoof Configuration ────
 WEBSHARE_TOKEN = os.environ.get("WEBSHARE_TOKEN", "")
 PROXY_LIST: list[dict] = []
 _proxy_index = 0
+
+# A rotation list of real residential/ISP IP addresses to bypass Cloudflare/datacenter blocks
+SPOOFED_IPS = [
+    "112.201.32.45",   # PLDT (Philippines)
+    "82.165.12.98",    # BT (UK)
+    "172.56.21.89",    # T-Mobile (US)
+    "73.142.121.4",    # Comcast (US)
+    "122.211.54.12",   # NTT (Japan)
+    "85.221.144.9",    # Orange (Poland)
+    "2.136.24.120",    # Telefonica (Spain)
+    "92.230.12.44",    # Deutsche Telekom (Germany)
+    "203.145.76.18",   # Globe (Philippines)
+    "24.18.241.109"    # Charter (US)
+]
+
+def _get_spoof_headers(custom_headers: dict = None) -> dict:
+    """Spoof X-Forwarded-For and other headers with a random residential IP."""
+    ip = random.choice(SPOOFED_IPS)
+    return {
+        "X-Forwarded-For": ip,
+        "X-Real-IP": ip,
+        "Client-IP": ip,
+        "CF-Connecting-IP": ip,
+        **(custom_headers or {})
+    }
 
 def _load_proxies_sync():
     """Fetch proxy list from Webshare API at startup."""
@@ -196,21 +221,41 @@ async def _get_bearer_token() -> str:
     global _bearer_token
     if _bearer_token:
         return _bearer_token
+
+    # 1. Try direct request with residential IP spoofing headers first
+    headers = _get_spoof_headers(DEFAULT_HEADERS)
+    try:
+        resp = await http_client_direct.get(f"{API_BASE}/home?host=moviebox.ph", headers=headers)
+        if resp.status_code == 200:
+            x_user = resp.headers.get("x-user")
+            if x_user:
+                _bearer_token = json.loads(x_user).get("token")
+            if not _bearer_token:
+                cookie = resp.headers.get("set-cookie", "")
+                import re as _re
+                m = _re.search(r"token=([^;]+)", cookie)
+                if m:
+                    _bearer_token = m.group(1)
+            if _bearer_token:
+                return _bearer_token
+    except Exception as e:
+        logger.warning(f"Direct token fetch failed (will fallback to proxy): {e}")
+
+    # 2. Proxy fallback
     client = await _get_proxied_client()
     try:
-        resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
+        resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=headers)
         x_user = resp.headers.get("x-user")
         if x_user:
             _bearer_token = json.loads(x_user).get("token")
         if not _bearer_token:
-            # fallback: read from set-cookie
             cookie = resp.headers.get("set-cookie", "")
             import re as _re
             m = _re.search(r"token=([^;]+)", cookie)
             if m:
                 _bearer_token = m.group(1)
     except Exception as e:
-        logger.warning(f"Token fetch failed: {e}")
+        logger.warning(f"Proxied token fetch failed: {e}")
     finally:
         if client is not http_client:
             await client.aclose()
@@ -222,10 +267,30 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
     headers = {
         **DEFAULT_HEADERS,
         "Authorization": f"Bearer {token}" if token else "",
-        **(custom_headers or {})
     }
+    headers = _get_spoof_headers(headers)
+    if custom_headers:
+        headers.update(custom_headers)
 
-    # Try all available proxies on 406/403/429 — shuffle so we don't always hit the same ones
+    # 1. Try direct with spoofing first
+    try:
+        if method == "POST":
+            resp = await http_client_direct.post(url, headers=headers, json=payload)
+        else:
+            resp = await http_client_direct.get(url, headers=headers)
+
+        if resp.status_code == 200:
+            x_user = resp.headers.get("x-user")
+            if x_user:
+                new_token = json.loads(x_user).get("token")
+                if new_token:
+                    _bearer_token = new_token
+            return resp.json()
+        logger.warning(f"Direct request to {url} returned {resp.status_code}, falling back to proxies...")
+    except Exception as e:
+        logger.warning(f"Direct request to {url} failed: {e}, falling back to proxies...")
+
+    # 2. Try all available proxies on failure
     last_error = None
     proxy_pool = list(PROXY_LIST) if PROXY_LIST else []
     if proxy_pool:
@@ -245,7 +310,6 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
             else:
                 resp = await client.get(url, headers=headers)
 
-            # Refresh token if server sends a new one
             x_user = resp.headers.get("x-user")
             if x_user:
                 new_token = json.loads(x_user).get("token")
@@ -255,7 +319,7 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
             if resp.status_code in (403, 406, 429):
                 logger.warning(f"Proxy {attempt+1}/{attempts} blocked (HTTP {resp.status_code}), trying next...")
                 last_error = f"Upstream API error: {resp.status_code}"
-                continue  # try next proxy
+                continue
 
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
@@ -1272,34 +1336,48 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep:
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    # Step 3: Try all proxies (shuffled) until hasResource=True
-    # netfilm.world blocks datacenter IPs just like the main API
+    # Step 3: Try direct with spoofing headers first
+    headers = {
+        **PLAYER_HEADERS,
+        "Referer": player_referer,
+    }
+    headers = _get_spoof_headers(headers)
+    
     data = {}
-    proxy_pool = list(PROXY_LIST) if PROXY_LIST else []
-    if proxy_pool:
-        random.shuffle(proxy_pool)
+    try:
+        resp = await http_client_direct.get(play_url, headers=headers)
+        result = resp.json().get("data", {})
+        if result.get("hasResource", False):
+            data = result
+    except Exception as e:
+        logger.warning(f"Direct player request failed: {e}")
 
-    attempts = len(proxy_pool) if proxy_pool else 1
-    for attempt in range(attempts):
+    # Fallback to proxies if direct failed or returned hasResource=False
+    if not data.get("hasResource", False):
+        proxy_pool = list(PROXY_LIST) if PROXY_LIST else []
         if proxy_pool:
-            p = proxy_pool[attempt]
-            proxy_url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
-            player_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, proxy=proxy_url)
-        else:
-            player_client = http_client
-        try:
-            resp = await player_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-            result = resp.json().get("data", {})
-            if result.get("hasResource", False) or attempt == attempts - 1:
-                data = result
-                break
-            # hasResource=False but there are more proxies to try
-            logger.info(f"Player proxy {attempt+1}/{attempts}: hasResource=False, trying next proxy...")
-        except Exception as e:
-            logger.warning(f"Player proxy {attempt+1} failed: {e}")
-        finally:
-            if player_client is not http_client:
-                await player_client.aclose()
+            random.shuffle(proxy_pool)
+
+        attempts = len(proxy_pool) if proxy_pool else 1
+        for attempt in range(attempts):
+            if proxy_pool:
+                p = proxy_pool[attempt]
+                proxy_url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
+                player_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, proxy=proxy_url)
+            else:
+                player_client = http_client
+            try:
+                resp = await player_client.get(play_url, headers=headers)
+                result = resp.json().get("data", {})
+                if result.get("hasResource", False) or attempt == attempts - 1:
+                    data = result
+                    break
+                logger.info(f"Player proxy {attempt+1}/{attempts}: hasResource=False, trying next proxy...")
+            except Exception as e:
+                logger.warning(f"Player proxy {attempt+1} failed: {e}")
+            finally:
+                if player_client is not http_client:
+                    await player_client.aclose()
 
     has_resource = data.get("hasResource", False)
     streams = [
@@ -1337,14 +1415,29 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    # Use proxied client for player domain
-    player_client = await _get_proxied_client()
+    # Use direct client with spoofing headers
+    headers = {
+        **PLAYER_HEADERS,
+        "Referer": player_referer,
+    }
+    headers = _get_spoof_headers(headers)
+    
+    play_data = {}
     try:
-        play_resp = await player_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
+        play_resp = await http_client_direct.get(play_url, headers=headers)
         play_data = play_resp.json().get("data", {})
-    finally:
-        if player_client is not http_client:
-            await player_client.aclose()
+    except Exception as e:
+        logger.warning(f"Direct captions fetch failed: {e}")
+
+    # Fallback to proxied client if direct fails or is empty
+    if not play_data:
+        player_client = await _get_proxied_client()
+        try:
+            play_resp = await player_client.get(play_url, headers=headers)
+            play_data = play_resp.json().get("data", {})
+        finally:
+            if player_client is not http_client:
+                await player_client.aclose()
 
     streams = play_data.get("streams", [])
     dash = play_data.get("dash", [])
