@@ -1,10 +1,49 @@
 import re
+import os
 import json
 import httpx
 import asyncio
+import random
+import logging
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
+
+logger = logging.getLogger("moviebox-api")
+
+# ──── Proxy Configuration ────
+WEBSHARE_TOKEN = os.environ.get("WEBSHARE_TOKEN", "")
+PROXY_LIST: list[dict] = []
+_proxy_index = 0
+
+def _load_proxies_sync():
+    """Fetch proxy list from Webshare API at startup."""
+    global PROXY_LIST
+    if not WEBSHARE_TOKEN:
+        logger.info("No WEBSHARE_TOKEN set – running without proxy")
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100",
+            headers={"Authorization": f"Token {WEBSHARE_TOKEN}"}
+        )
+        data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        PROXY_LIST = data.get("results", [])
+        logger.info(f"Loaded {len(PROXY_LIST)} proxies from Webshare")
+    except Exception as e:
+        logger.warning(f"Failed to load proxies: {e}")
+
+_load_proxies_sync()
+
+def _get_next_proxy_url() -> str | None:
+    """Round-robin proxy URL for httpx."""
+    global _proxy_index
+    if not PROXY_LIST:
+        return None
+    p = PROXY_LIST[_proxy_index % len(PROXY_LIST)]
+    _proxy_index += 1
+    return f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
 
 app = FastAPI(
     title="MovieBox API Pro",
@@ -13,11 +52,25 @@ app = FastAPI(
 )
 
 # Shared global AsyncClient for connection pooling and Keep-Alive reuse
-http_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+# If proxies are available, create a proxied client for upstream requests
+def _build_http_client(proxy_url: str | None = None) -> httpx.AsyncClient:
+    kwargs = {"follow_redirects": True, "timeout": 30.0}
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+    return httpx.AsyncClient(**kwargs)
+
+_initial_proxy = _get_next_proxy_url()
+http_client = _build_http_client(_initial_proxy)
+if _initial_proxy:
+    logger.info(f"http_client using proxy")
+
+# Direct client (no proxy) for non-upstream requests like streaming
+http_client_direct = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await http_client.aclose()
+    await http_client_direct.aclose()
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,7 +139,6 @@ async def debug_search(q: str = "One Piece"):
 
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
-import os
 LOCAL_API = f"http://127.0.0.1:{os.environ.get('PORT', '8000')}"
 
 
@@ -125,13 +177,21 @@ PLAYER_HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
+async def _get_proxied_client() -> httpx.AsyncClient:
+    """Get an httpx client with a rotated proxy (or direct if no proxies)."""
+    proxy_url = _get_next_proxy_url()
+    if proxy_url:
+        return httpx.AsyncClient(follow_redirects=True, timeout=30.0, proxy=proxy_url)
+    return http_client
+
 async def _get_bearer_token() -> str:
     """Auto-acquire a guest JWT from the x-user response header."""
     global _bearer_token
     if _bearer_token:
         return _bearer_token
+    client = await _get_proxied_client()
     try:
-        resp = await http_client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
+        resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
         x_user = resp.headers.get("x-user")
         if x_user:
             _bearer_token = json.loads(x_user).get("token")
@@ -142,8 +202,11 @@ async def _get_bearer_token() -> str:
             m = _re.search(r"token=([^;]+)", cookie)
             if m:
                 _bearer_token = m.group(1)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Token fetch failed: {e}")
+    finally:
+        if client is not http_client:
+            await client.aclose()
     return _bearer_token or ""
 
 async def _make_request(url: str, method: str = "GET", payload: dict = None, custom_headers: dict = None) -> dict:
@@ -154,26 +217,45 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
         "Authorization": f"Bearer {token}" if token else "",
         **(custom_headers or {})
     }
-    try:
-        if method == "POST":
-            resp = await http_client.post(url, headers=headers, json=payload)
-        else:
-            resp = await http_client.get(url, headers=headers)
+    
+    # Try with proxy rotation (up to 3 proxies on failure)
+    last_error = None
+    attempts = min(3, max(1, len(PROXY_LIST))) if PROXY_LIST else 1
+    
+    for attempt in range(attempts):
+        client = await _get_proxied_client()
+        try:
+            if method == "POST":
+                resp = await client.post(url, headers=headers, json=payload)
+            else:
+                resp = await client.get(url, headers=headers)
 
-        # Refresh token if server sends a new one
-        x_user = resp.headers.get("x-user")
-        if x_user:
-            new_token = json.loads(x_user).get("token")
-            if new_token:
-                _bearer_token = new_token
+            # Refresh token if server sends a new one
+            x_user = resp.headers.get("x-user")
+            if x_user:
+                new_token = json.loads(x_user).get("token")
+                if new_token:
+                    _bearer_token = new_token
 
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
+            if resp.status_code in (403, 406, 429):
+                logger.warning(f"Proxy blocked (HTTP {resp.status_code}), attempt {attempt+1}/{attempts}")
+                last_error = f"Upstream API error: {resp.status_code}"
+                continue  # try next proxy
+                
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
 
-        return resp.json()
-    except Exception as e:
-        if isinstance(e, HTTPException): raise e
-        raise HTTPException(status_code=502, detail=f"Request failed: {str(e)}")
+            return resp.json()
+        except HTTPException:
+            raise
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"Request attempt {attempt+1} failed: {e}")
+        finally:
+            if client is not http_client:
+                await client.aclose()
+    
+    raise HTTPException(status_code=502, detail=f"Request failed after {attempts} attempts: {last_error}")
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
