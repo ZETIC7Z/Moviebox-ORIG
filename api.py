@@ -26,6 +26,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/api/test_upstream")
+async def test_upstream():
+    try:
+        resp = await http_client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
+        return {
+            "status_code": resp.status_code,
+            "headers": dict(resp.headers),
+            "body_snippet": resp.text[:1000]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 
