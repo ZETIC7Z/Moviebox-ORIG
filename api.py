@@ -1246,7 +1246,7 @@ async def get_movie_detail(slug: str):
 
 @app.get("/api/stream/{subject_id}")
 async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep: int = 1):
-    # Step 1: get the player domain
+    # Step 1: get the player domain (via proxied client)
     dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
     domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
 
@@ -1257,8 +1257,14 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep:
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    resp = await http_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-    data = resp.json().get("data", {})
+    # Use proxied client so datacenter IPs don't get blocked
+    player_client = await _get_proxied_client()
+    try:
+        resp = await player_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
+        data = resp.json().get("data", {})
+    finally:
+        if player_client is not http_client:
+            await player_client.aclose()
 
     has_resource = data.get("hasResource", False)
     streams = [
@@ -1296,8 +1302,14 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    play_resp = await http_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-    play_data = play_resp.json().get("data", {})
+    # Use proxied client for player domain
+    player_client = await _get_proxied_client()
+    try:
+        play_resp = await player_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
+        play_data = play_resp.json().get("data", {})
+    finally:
+        if player_client is not http_client:
+            await player_client.aclose()
 
     streams = play_data.get("streams", [])
     dash = play_data.get("dash", [])
@@ -1520,50 +1532,29 @@ async def handle_tv_stream(tmdb_id: int, season: int, episode: int, request: Req
         else:
             se = 1
 
-    stream_url = f"{LOCAL_API}/api/stream/{subject_id}?detail_path={slug}&se={se}&ep={ep}"
     try:
-        stream_resp = await http_client.get(stream_url)
-        stream_data = stream_resp.json()
-        
-        # If no streams found and a custom dub language was requested, fall back to Japanese (Original)
+        stream_data = await get_stream_sources(subject_id, detail_path=slug, se=se, ep=ep)
+
+        # If no streams found and a custom dub language was requested, fall back to original
         if not stream_data.get("sources") and not stream_data.get("hls") and not stream_data.get("dash") and lang and lang.lower() not in ["ja", "original"]:
-            orig_subject_id, orig_slug, orig_seasons, _, _ = await _resolve_subject(tmdb_id, is_tv=True, lang=None)
-            
+            orig_subject_id, orig_slug, orig_seasons, _, _, _ = await _resolve_subject(tmdb_id, is_tv=True, lang=None)
+
             orig_se = season
             orig_available_seasons = []
             for s in orig_seasons:
                 if isinstance(s, dict):
                     orig_available_seasons.append(s.get("se"))
-                elif isinstance(s, str) and "se=" in s:
-                    try:
-                        orig_se_val = int(s.split("se=")[1].split(";")[0])
-                        orig_available_seasons.append(orig_se_val)
-                    except Exception:
-                        pass
             if season not in orig_available_seasons and orig_seasons:
                 first_s = orig_seasons[0]
-                if isinstance(first_s, dict):
-                    orig_se = first_s.get("se", 1)
-                elif isinstance(first_s, str) and "se=" in first_s:
-                    try:
-                        orig_se = int(first_s.split("se=")[1].split(";")[0])
-                    except Exception:
-                        orig_se = 1
-                else:
-                    orig_se = 1
+                orig_se = first_s.get("se", 1) if isinstance(first_s, dict) else 1
 
-            stream_url = f"{LOCAL_API}/api/stream/{orig_subject_id}?detail_path={orig_slug}&se={orig_se}&ep={episode}"
-            stream_resp = await http_client.get(stream_url)
-            stream_data = stream_resp.json()
-            
-            captions_url = f"{LOCAL_API}/api/stream/{orig_subject_id}/captions?detail_path={orig_slug}&se={orig_se}&ep={episode}"
-            captions_resp = await http_client.get(captions_url)
-            captions_data = captions_resp.json()
+            stream_data = await get_stream_sources(orig_subject_id, detail_path=orig_slug, se=orig_se, ep=episode)
+            captions_data = await get_captions(orig_subject_id, detail_path=orig_slug, se=orig_se, ep=episode)
         else:
-            captions_url = f"{LOCAL_API}/api/stream/{subject_id}/captions?detail_path={slug}&se={se}&ep={ep}"
-            captions_resp = await http_client.get(captions_url)
-            captions_data = captions_resp.json()
+            captions_data = await get_captions(subject_id, detail_path=slug, se=se, ep=ep)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
 
@@ -1634,19 +1625,16 @@ async def handle_tv_stream(tmdb_id: int, season: int, episode: int, request: Req
 
 async def handle_movie_stream(tmdb_id: int, request: Request, lang: str | None = None):
     subject_id, slug, seasons, dubs, tmdb_title, _ = await _resolve_subject(tmdb_id, is_tv=False, lang=lang)
-    
+
     se = seasons[0].get("se", 0) if seasons else 0
     ep = seasons[0].get("maxEp", 0) if seasons else 0
-    
-    stream_url = f"{LOCAL_API}/api/stream/{subject_id}?detail_path={slug}&se={se}&ep={ep}"
-    try:
-        stream_resp = await http_client.get(stream_url)
-        stream_data = stream_resp.json()
-        
-        captions_url = f"{LOCAL_API}/api/stream/{subject_id}/captions?detail_path={slug}&se={se}&ep={ep}"
-        captions_resp = await http_client.get(captions_url)
-        captions_data = captions_resp.json()
 
+    try:
+        # Direct function call — no LOCAL_API self-call needed
+        stream_data = await get_stream_sources(subject_id, detail_path=slug, se=se, ep=ep)
+        captions_data = await get_captions(subject_id, detail_path=slug, se=se, ep=ep)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
 
