@@ -1261,7 +1261,7 @@ async def get_movie_detail(slug: str):
 
 @app.get("/api/stream/{subject_id}")
 async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep: int = 1):
-    # Step 1: get the player domain (via proxied client)
+    # Step 1: get the player domain
     dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
     domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
 
@@ -1272,14 +1272,34 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep:
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
-    # Use proxied client so datacenter IPs don't get blocked
-    player_client = await _get_proxied_client()
-    try:
-        resp = await player_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-        data = resp.json().get("data", {})
-    finally:
-        if player_client is not http_client:
-            await player_client.aclose()
+    # Step 3: Try all proxies (shuffled) until hasResource=True
+    # netfilm.world blocks datacenter IPs just like the main API
+    data = {}
+    proxy_pool = list(PROXY_LIST) if PROXY_LIST else []
+    if proxy_pool:
+        random.shuffle(proxy_pool)
+
+    attempts = len(proxy_pool) if proxy_pool else 1
+    for attempt in range(attempts):
+        if proxy_pool:
+            p = proxy_pool[attempt]
+            proxy_url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
+            player_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, proxy=proxy_url)
+        else:
+            player_client = http_client
+        try:
+            resp = await player_client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
+            result = resp.json().get("data", {})
+            if result.get("hasResource", False) or attempt == attempts - 1:
+                data = result
+                break
+            # hasResource=False but there are more proxies to try
+            logger.info(f"Player proxy {attempt+1}/{attempts}: hasResource=False, trying next proxy...")
+        except Exception as e:
+            logger.warning(f"Player proxy {attempt+1} failed: {e}")
+        finally:
+            if player_client is not http_client:
+                await player_client.aclose()
 
     has_resource = data.get("hasResource", False)
     streams = [
