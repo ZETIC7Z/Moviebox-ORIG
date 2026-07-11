@@ -45,6 +45,13 @@ def _get_next_proxy_url() -> str | None:
     _proxy_index += 1
     return f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
 
+def _get_random_proxy_url() -> str | None:
+    """Pick a random proxy to spread load and avoid sequential blocks."""
+    if not PROXY_LIST:
+        return None
+    p = random.choice(PROXY_LIST)
+    return f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
+
 app = FastAPI(
     title="MovieBox API Pro",
     description="Full Pure REST API for moviebox.ph — Zero Scraping",
@@ -217,13 +224,21 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
         "Authorization": f"Bearer {token}" if token else "",
         **(custom_headers or {})
     }
-    
-    # Try with proxy rotation (up to 3 proxies on failure)
+
+    # Try all available proxies on 406/403/429 — shuffle so we don't always hit the same ones
     last_error = None
-    attempts = min(3, max(1, len(PROXY_LIST))) if PROXY_LIST else 1
-    
+    proxy_pool = list(PROXY_LIST) if PROXY_LIST else []
+    if proxy_pool:
+        random.shuffle(proxy_pool)
+    attempts = len(proxy_pool) if proxy_pool else 1
+
     for attempt in range(attempts):
-        client = await _get_proxied_client()
+        if proxy_pool:
+            p = proxy_pool[attempt]
+            proxy_url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
+            client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, proxy=proxy_url)
+        else:
+            client = http_client
         try:
             if method == "POST":
                 resp = await client.post(url, headers=headers, json=payload)
@@ -238,10 +253,10 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
                     _bearer_token = new_token
 
             if resp.status_code in (403, 406, 429):
-                logger.warning(f"Proxy blocked (HTTP {resp.status_code}), attempt {attempt+1}/{attempts}")
+                logger.warning(f"Proxy {attempt+1}/{attempts} blocked (HTTP {resp.status_code}), trying next...")
                 last_error = f"Upstream API error: {resp.status_code}"
                 continue  # try next proxy
-                
+
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
 
@@ -254,7 +269,7 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
         finally:
             if client is not http_client:
                 await client.aclose()
-    
+
     raise HTTPException(status_code=502, detail=f"Request failed after {attempts} attempts: {last_error}")
 
 @app.get("/", response_class=HTMLResponse)
