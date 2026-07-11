@@ -38,9 +38,57 @@ async def test_upstream():
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/api/debug_search")
+async def debug_search(q: str = "One Piece"):
+    token = await _get_bearer_token()
+    results = {}
+    
+    # Test 1: Default headers
+    headers1 = {
+        **DEFAULT_HEADERS,
+        "Authorization": f"Bearer {token}" if token else ""
+    }
+    try:
+        r = await http_client.post(f"{API_BASE}/subject/search", headers=headers1, json={"keyword": q, "page": 1, "perPage": 20})
+        results["test1_default"] = {"status": r.status_code, "body": r.text[:200]}
+    except Exception as e:
+        results["test1_default"] = {"error": str(e)}
+        
+    # Test 2: Minimal headers
+    headers2 = {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}" if token else ""
+    }
+    try:
+        r = await http_client.post(f"{API_BASE}/subject/search", headers=headers2, json={"keyword": q, "page": 1, "perPage": 20})
+        results["test2_minimal"] = {"status": r.status_code, "body": r.text[:200]}
+    except Exception as e:
+        results["test2_minimal"] = {"error": str(e)}
+
+    # Test 3: No Accept-Encoding or custom accept
+    headers3 = {
+        **headers2,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://moviebox.ph",
+        "Referer": "https://moviebox.ph/"
+    }
+    try:
+        r = await http_client.post(f"{API_BASE}/subject/search", headers=headers3, json={"keyword": q, "page": 1, "perPage": 20})
+        results["test3_browser_like"] = {"status": r.status_code, "body": r.text[:200]}
+    except Exception as e:
+        results["test3_browser_like"] = {"error": str(e)}
+
+    return results
+
+
 
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
+import os
+LOCAL_API = f"http://127.0.0.1:{os.environ.get('PORT', '8000')}"
+
 
 _bearer_token: str | None = None
 
@@ -1390,7 +1438,7 @@ async def handle_tv_stream(tmdb_id: int, season: int, episode: int, request: Req
         else:
             se = 1
 
-    stream_url = f"http://localhost:8000/api/stream/{subject_id}?detail_path={slug}&se={se}&ep={ep}"
+    stream_url = f"{LOCAL_API}/api/stream/{subject_id}?detail_path={slug}&se={se}&ep={ep}"
     try:
         stream_resp = await http_client.get(stream_url)
         stream_data = stream_resp.json()
@@ -1422,17 +1470,18 @@ async def handle_tv_stream(tmdb_id: int, season: int, episode: int, request: Req
                 else:
                     orig_se = 1
 
-            stream_url = f"http://localhost:8000/api/stream/{orig_subject_id}?detail_path={orig_slug}&se={orig_se}&ep={episode}"
+            stream_url = f"{LOCAL_API}/api/stream/{orig_subject_id}?detail_path={orig_slug}&se={orig_se}&ep={episode}"
             stream_resp = await http_client.get(stream_url)
             stream_data = stream_resp.json()
             
-            captions_url = f"http://localhost:8000/api/stream/{orig_subject_id}/captions?detail_path={orig_slug}&se={orig_se}&ep={episode}"
+            captions_url = f"{LOCAL_API}/api/stream/{orig_subject_id}/captions?detail_path={orig_slug}&se={orig_se}&ep={episode}"
             captions_resp = await http_client.get(captions_url)
             captions_data = captions_resp.json()
         else:
-            captions_url = f"http://localhost:8000/api/stream/{subject_id}/captions?detail_path={slug}&se={se}&ep={ep}"
+            captions_url = f"{LOCAL_API}/api/stream/{subject_id}/captions?detail_path={slug}&se={se}&ep={ep}"
             captions_resp = await http_client.get(captions_url)
             captions_data = captions_resp.json()
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
 
@@ -1507,14 +1556,15 @@ async def handle_movie_stream(tmdb_id: int, request: Request, lang: str | None =
     se = seasons[0].get("se", 0) if seasons else 0
     ep = seasons[0].get("maxEp", 0) if seasons else 0
     
-    stream_url = f"http://localhost:8000/api/stream/{subject_id}?detail_path={slug}&se={se}&ep={ep}"
+    stream_url = f"{LOCAL_API}/api/stream/{subject_id}?detail_path={slug}&se={se}&ep={ep}"
     try:
         stream_resp = await http_client.get(stream_url)
         stream_data = stream_resp.json()
         
-        captions_url = f"http://localhost:8000/api/stream/{subject_id}/captions?detail_path={slug}&se={se}&ep={ep}"
+        captions_url = f"{LOCAL_API}/api/stream/{subject_id}/captions?detail_path={slug}&se={se}&ep={ep}"
         captions_resp = await http_client.get(captions_url)
         captions_data = captions_resp.json()
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
 
