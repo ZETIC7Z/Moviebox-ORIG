@@ -1,6 +1,6 @@
 import httpx, json
 
-BASE = "http://localhost:8000"
+BASE = "http://152.42.223.175:8000"
 
 ENDPOINTS = [
     "/",
